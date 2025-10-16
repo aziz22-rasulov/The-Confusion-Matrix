@@ -139,4 +139,3 @@ def validate_and_process_query(query: str, metadata: Dict[str, Any] = None, inde
     }
 
 
-А этот что делает, он из того же проекта 
