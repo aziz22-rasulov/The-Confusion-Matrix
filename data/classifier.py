@@ -62,14 +62,14 @@ def classify_query(query, metadata):
         }
 
 
-def verify_candidate_with_llm(query: str, answer: str, refinement_temperature: float = 0.2, relevance_threshold: float = 0.6) -> Tuple[bool, str]:
+def verify_candidate_with_llm(query: str, answer: str, refinement_temperature: float = 0.2, relevance_threshold: float = 0.6) -> Tuple[bool, str, float]:
     """
     Проверяет релевантность кандидатного ответа и при необходимости переформулирует его.
     
     ВАЖНО: Если ответ релевантен, LLM должен переформулировать его, начиная с 
     фразы, которая прямо отвечает на вопрос клиента, а затем продолжаться фактами.
 
-    Возвращает (is_relevant, refined_answer). В случае ошибки ЛЛМ считаем ответ релевантным и возвращаем исходный текст.
+    Возвращает (is_relevant, refined_answer, confidence). В случае ошибки ЛЛМ считаем ответ релевантным и возвращаем исходный текст.
     """
     # ОБНОВЛЕННЫЙ ПРОМПТ
     prompt = f"""
@@ -112,13 +112,16 @@ def verify_candidate_with_llm(query: str, answer: str, refinement_temperature: f
         confidence = float(verdict.get("confidence", 0.0))
         refined_answer = verdict.get("refined_answer") or answer
 
-        if not is_relevant or confidence < relevance_threshold:
-            return False, answer
+        if not is_relevant:
+            return False, answer, confidence
 
-        return True, refined_answer
+        if confidence < relevance_threshold:
+            return True, answer, confidence
+
+        return True, refined_answer, confidence
     except Exception as exc:
         logger.warning("LLM verification failed, using original answer: %s", exc)
-        return True, answer
+        return True, answer, 0.0
 
 
 __all__ = ["classify_query", "verify_candidate_with_llm"]
