@@ -65,6 +65,14 @@ def _format_response(
         except (TypeError, ValueError):
             classifier_confidence = None
 
+    classification_payload: Optional[Dict[str, Optional[str]]] = None
+    if classification:
+        classification_payload = {
+            'main_category': classification.get('main_category'),
+            'sub_category': classification.get('sub_category'),
+            'confidence': classifier_confidence,
+        }
+
     if top_item:
         category_path = _build_category_path(
             top_item.get('main_category'),
@@ -130,6 +138,10 @@ def _format_response(
             'category_path': category_path,
             'recommended_answer': recommended_answer,
             'llm_confidence': llm_confidence,
+            'match_main_category': top_item.get('main_category'),
+            'match_sub_category': top_item.get('sub_category'),
+            'match_similarity': similarity_score,
+            'classification': classification_payload,
         }
 
     fallback_path = None
@@ -143,6 +155,10 @@ def _format_response(
         'category_path': fallback_path,
         'recommended_answer': None,
         'llm_confidence': None,
+        'match_main_category': None,
+        'match_sub_category': None,
+        'match_similarity': None,
+        'classification': classification_payload,
     }
 
 

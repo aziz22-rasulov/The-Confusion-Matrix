@@ -7,6 +7,20 @@ from .config import CLASSIFIER_MODEL, client
 
 logger = logging.getLogger(__name__)
 
+_CRITICAL_MARKERS = (
+    "нет",
+    "нельзя",
+    "запрещено",
+    "не допускается",
+    "не разрешается",
+    "не должен",
+    "не должна",
+    "не должны",
+    "не может",
+    "не могут",
+    "не предоставляется",
+)
+
 
 def _parse_llm_json(raw_content: str) -> dict:
     """Parse JSON returned by the LLM, tolerating minor format deviations."""
@@ -108,9 +122,12 @@ def verify_candidate_with_llm(
     Проверяет, подходит ли шаблонный ответ к вопросу. При необходимости улучшает формулировку.
     Возвращает кортеж (is_relevant, refined_answer, confidence).
     """
+    raw_markers = {marker for marker in _CRITICAL_MARKERS if marker in answer.lower()}
+
     prompt = f"""
 Ты — контролёр качества FAQ банка. Определи, подходит ли шаблонный ответ к вопросу клиента.
-Если ответ корректен, улучши формулировку, сохранив факты. Ответь строго JSON-объектом.
+Если ответ корректен, улучши формулировку, сохранив факты. Сохраняй категоричность исходного ответа:
+если в шаблоне есть запрет/ограничение, оно должно явно звучать. Ответь строго JSON-объектом.
 
 Вопрос: "{query}"
 Шаблонный ответ: "{answer}"
@@ -129,7 +146,7 @@ def verify_candidate_with_llm(
             messages=[
                 {
                     "role": "system",
-                    "content": "Ты проверяешь качество FAQ банка. Отвечай строго JSON-объектом.",
+                    "content": "Ты проверяешь качество FAQ банка. Отвечай строго JSON-объектом и не искажай исходный смысл.",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -148,6 +165,16 @@ def verify_candidate_with_llm(
 
         if confidence < relevance_threshold:
             return False, answer, confidence
+
+        if raw_markers:
+            refined_lower = refined_answer.lower()
+            missing_markers = [marker for marker in raw_markers if marker not in refined_lower]
+            if missing_markers:
+                logger.debug(
+                    "Refined answer dropped critical markers %s; falling back to template.",
+                    missing_markers,
+                )
+                return True, answer, min(confidence, relevance_threshold)
 
         return True, refined_answer, confidence
     except Exception as exc:

@@ -8,7 +8,7 @@ from openai import OpenAI
 API_URL = "https://llm.t1v.scibox.tech/v1/embeddings"
 API_KEY = os.getenv("SCIBOX_API_KEY", "sk-dgKROD7rG4yPAo7bTOtatA")  # замените на ваш ключ
 MODEL = "bge-m3"
-CLASSIFIER_MODEL = "Qwen2.5-72B-Instruct-AWQ"
+CLASSIFIER_MODEL = "qwen2.5-72b-h100"
 BATCH_SIZE = 128
 DATA_DIR = "data"
 SOURCE_EXCEL = "smart_support_vtb_belarus_faq_final.xlsx"
