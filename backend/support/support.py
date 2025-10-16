@@ -6,9 +6,13 @@ import re
 from typing import Any, Dict, List, Optional
 
 # Предполагается, что search_and_rank определен и умеет принимать exclude_idx
-from data import search_and_rank 
+from data import search_and_rank, verify_candidate_with_llm
 
 logger = logging.getLogger(__name__)
+
+MIN_CLASSIFIER_CONFIDENCE = 0.55
+MIN_FUZZY_SIMILARITY = 0.45
+MIN_LLM_CONFIDENCE = 0.6
 
 
 def _load_metadata(metadata: Dict[str, Any] = None):
@@ -39,6 +43,109 @@ def _score_match(query: str, candidate: str) -> float:
     return 0.7 * s + 0.3 * token_score
 
 
+
+
+def _build_category_path(main_category: Optional[str], sub_category: Optional[str]) -> Optional[str]:
+    parts = [part for part in (main_category, sub_category) if part]
+    if not parts:
+        return None
+    return " > ".join(parts)
+
+
+def _format_response(
+    query: str,
+    items: List[Dict[str, Any]],
+    classification: Optional[Dict[str, Any]] = None
+) -> Dict[str, Optional[str]]:
+    top_item = items[0] if items else None
+    classifier_confidence: Optional[float] = None
+    if classification:
+        try:
+            classifier_confidence = float(classification.get('confidence', 0.0))
+        except (TypeError, ValueError):
+            classifier_confidence = None
+
+    if top_item:
+        category_path = _build_category_path(
+            top_item.get('main_category'),
+            top_item.get('sub_category'),
+        )
+
+        if category_path is None and classification:
+            category_path = _build_category_path(
+                classification.get('main_category'),
+                classification.get('sub_category'),
+            )
+
+        recommended_answer = top_item.get('template_answer')
+        llm_confidence = top_item.get('llm_confidence')
+
+        if recommended_answer and llm_confidence is None:
+            raw_answer = top_item.get('raw_answer') or recommended_answer
+            try:
+                is_relevant, refined_answer, confidence = verify_candidate_with_llm(query, raw_answer)
+                if is_relevant:
+                    recommended_answer = refined_answer
+                    llm_confidence = confidence
+                else:
+                    recommended_answer = raw_answer
+            except Exception as refine_error:
+                logger.warning(
+                    "Classifier refinement failed, returning original answer: %s",
+                    refine_error,
+                    exc_info=True,
+                )
+                recommended_answer = raw_answer
+
+        similarity_score = top_item.get('similarity_score')
+        try:
+            similarity_score = float(similarity_score)
+        except (TypeError, ValueError):
+            similarity_score = None
+
+        try:
+            llm_confidence = float(llm_confidence) if llm_confidence is not None else None
+        except (TypeError, ValueError):
+            llm_confidence = None
+
+        should_return_answer = False
+        if llm_confidence is not None and llm_confidence >= MIN_LLM_CONFIDENCE:
+            should_return_answer = True
+        elif similarity_score is not None and similarity_score >= MIN_FUZZY_SIMILARITY:
+            if classifier_confidence is None or classifier_confidence >= MIN_CLASSIFIER_CONFIDENCE:
+                should_return_answer = True
+
+        if not should_return_answer:
+            logger.debug(
+                "Suppressing template answer due to low confidence: query='%s', similarity=%s, classifier_conf=%s, llm_conf=%s",
+                query,
+                similarity_score,
+                classifier_confidence,
+                llm_confidence,
+            )
+            recommended_answer = None
+            llm_confidence = None
+
+        return {
+            'category_path': category_path,
+            'recommended_answer': recommended_answer,
+            'llm_confidence': llm_confidence,
+        }
+
+    fallback_path = None
+    if classification:
+        fallback_path = _build_category_path(
+            classification.get('main_category'),
+            classification.get('sub_category'),
+        )
+
+    return {
+        'category_path': fallback_path,
+        'recommended_answer': None,
+        'llm_confidence': None,
+    }
+
+
 def validate_and_process_query(
     query: str, 
     metadata: Dict[str, Any] = None, 
@@ -62,7 +169,7 @@ def validate_and_process_query(
         exclude_idx: список индексов (int) ответов, которые нужно исключить из поиска.
     
     Возвращает:
-        dict с ключом 'status' и 'results' — списком рекомендованных ответов
+        dict with keys 'category_path', 'recommended_answer', 'llm_confidence'
     """
     if not query or len(query.strip()) < 3:
         raise ValueError("Вопрос слишком короткий или отсутствует. Пожалуйста, сформулируйте более подробный запрос.")
@@ -80,6 +187,7 @@ def validate_and_process_query(
         exclude_idx = []
 
     vector_results = []
+    classification = None
     if index is not None:
         try:
             # ПЕРЕДАЧА ИНДЕКСОВ ДЛЯ ИСКЛЮЧЕНИЯ В search_and_rank
@@ -95,22 +203,14 @@ def validate_and_process_query(
             )
             vector_results = vector_payload.get('results', []) if isinstance(vector_payload, dict) else vector_payload
             classification = vector_payload.get('classification', {}) if isinstance(vector_payload, dict) else {}
-            strategy = vector_payload.get('strategy', 'vector') if isinstance(vector_payload, dict) else 'vector'
         
         except Exception as vector_error:
             logger.warning("Vector search failed, fallback to fuzzy matching: %s", vector_error, exc_info=True)
             vector_results = []
             classification = {}
-            strategy = 'fuzzy'
 
     if vector_results:
-        return {
-            'status': 'success',
-            'query': query,
-            'classification': classification,
-            'strategy': strategy,
-            'results': vector_results
-        }
+        return _format_response(query, vector_results, classification)
 
     # Логика фаззи-поиска:
     
@@ -164,8 +264,4 @@ def validate_and_process_query(
         }
         results.append(ans)
 
-    return {
-        'status': 'success',
-        'query': query,
-        'results': results
-    }
+    return _format_response(query, results, classification)
