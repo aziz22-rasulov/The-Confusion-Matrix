@@ -5,7 +5,7 @@ import os
 import re
 from typing import Any, Dict, List
 
-from data.vector import search_and_rank
+from data import search_and_rank
 
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def validate_and_process_query(query: str, metadata: Dict[str, Any] = None, inde
 
     Аргументы:
         query: текст запроса
-        metadata: словарь с полями, сгенерированными в data/vector.py (example_questions, template_answers и т.д.)
+        metadata: словарь с полями, сгенерированными в data/embeddings.py (example_questions, template_answers и т.д.)
         index: опционально — faiss индекс (не обязателен для локального поиска)
         target_audience: фильтр по аудитории (по желанию)
         top_k: сколько кандидатов вернуть для ранжирования
