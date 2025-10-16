@@ -1,122 +1,141 @@
+import difflib
 import json
 import logging
-from typing import Tuple
+import os
+import re
+from typing import Any, Dict, List
 
-from .config import CLASSIFIER_MODEL, client
+from data import search_and_rank
+
 
 logger = logging.getLogger(__name__)
 
 
-def classify_query(query, metadata):
-    """
-    Классифицирует запрос по основной категории и подкатегории
-    с использованием Qwen2.5-72B-Instruct-AWQ
-    """
-    categories = list({cat for cat in metadata['main_categories'] if cat})
-    sub_categories = list({sub for sub in metadata['sub_categories'] if sub})
-
-    prompt = f"""
-    Ты - эксперт по классификации запросов клиентов банка ВТБ (Беларусь).
-    Проанализируй следующий запрос и определи его основную категорию и подкатегорию.
-
-    Доступные основные категории: {', '.join(categories)}
-    Доступные подкатегории: {', '.join(sub_categories)}
-
-    Запрос клиента: "{query}"
-
-    Верни ответ в строго форматированном JSON:
-    {{
-        "main_category": "название основной категории",
-        "sub_category": "название подкатегории",
-        "confidence": "уверенность от 0.0 до 1.0"
-    }}
-
-    Если запрос не относится ни к одной из категорий, верни:
-    {{
-        "main_category": "Техническая поддержка",
-        "sub_category": "Проблемы и решения",
-        "confidence": 0.8
-    }}
-    """
-
-    try:
-        response = client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[
-                {"role": "system", "content": "Ты - эксперт по классификации запросов клиентов банка."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=300
-        )
-
-        result = json.loads(response.choices[0].message.content)
-        return result
-    except Exception as exc:
-        logger.warning("Ошибка при классификации: %s", exc)
-        return {
-            "main_category": "Техническая поддержка",
-            "sub_category": "Проблемы и решения",
-            "confidence": 0.5
-        }
+def _load_metadata(metadata: Dict[str, Any] = None):
+    """Если metadata не переданы, попробуем загрузить их из data/data/knowledge_base_metadata.json"""
+    if metadata:
+        return metadata
+    base = os.getcwd()
+    metadata_path = os.path.join(base, 'data', 'data', 'knowledge_base_metadata.json')
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"metadata not found: {metadata_path}")
+    with open(metadata_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 
-def verify_candidate_with_llm(query: str, answer: str, refinement_temperature: float = 0.2, relevance_threshold: float = 0.6) -> Tuple[bool, str]:
-    """
-    Проверяет релевантность кандидатного ответа и при необходимости переформулирует его.
-    
-    ВАЖНО: При переформулировании LLM должен начинать ответ с прямого ответа на вопрос.
-
-    Возвращает (is_relevant, refined_answer). В случае ошибки ЛЛМ считаем ответ релевантным и возвращаем исходный текст.
-    """
-    # *** ИЗМЕНЕННЫЙ ПРОМПТ ДЛЯ УЛУЧШЕНИЯ ФОРМУЛИРОВКИ ***
-    prompt = f"""
-Ты — помощник, который проверяет ответ базы знаний и адаптирует его под конкретный вопрос клиента.
-Проанализируй вопрос и ответ.
-
-Если ответ **релевантен**, ты должен **переформулировать** его, чтобы он **начинался с фразы-реакции, которая прямо отвечает на вопрос** клиента, а затем продолжался фактологической информацией из базы знаний.
-Сохраняй все факты и цифры из исходного ответа.
-
-Пример желаемой формулировки:
-Вопрос: "Как взять кредит в декрете?"
-Ответ базы знаний: "Гражданам, находящимся в отпуске по уходу за ребенком, кредиты не выдаются."
-Твой refined_answer: "Взять кредит в декрете не получится. Это связано с тем, что..." (далее факты из исходного ответа).
-
-Вопрос: "{query}"
-Ответ базы знаний: "{answer}"
-
-Ответь строго в формате JSON:
-{{
-  "relevant": true или false,
-  "refined_answer": "переформулированный ответ (если релевантен, иначе пустая строка)",
-  "confidence": число от 0 до 1
-}}
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model=CLASSIFIER_MODEL,
-            messages=[
-                {"role": "system", "content": "Ты помощник, проверяющий релевантность ответов FAQ банка. Говоришь по-русски."},
-                {"role": "user", "content": prompt.strip()}
-            ],
-            temperature=refinement_temperature,
-            max_tokens=300 # Увеличен max_tokens, чтобы дать место для более длинной переформулировки
-        )
-
-        verdict = json.loads(response.choices[0].message.content.strip())
-
-        is_relevant = bool(verdict.get("relevant"))
-        confidence = float(verdict.get("confidence", 0.0))
-        refined_answer = verdict.get("refined_answer") or answer
-
-        if not is_relevant or confidence < relevance_threshold:
-            return False, answer
-
-        return True, refined_answer
-    except Exception as exc:
-        logger.warning("LLM verification failed, using original answer: %s", exc)
-        return True, answer
+def _score_match(query: str, candidate: str) -> float:
+    """Простая функция оценки совпадения между строками (0..1)"""
+    if not candidate:
+        return 0.0
+    # Используем сочетание SequenceMatcher и простого пересечения токенов
+    s = difflib.SequenceMatcher(None, query.lower(), candidate.lower()).ratio()
+    q_tokens = set(re.findall(r"\w+", query.lower()))
+    c_tokens = set(re.findall(r"\w+", candidate.lower()))
+    if not q_tokens or not c_tokens:
+        token_score = 0.0
+    else:
+        token_score = len(q_tokens & c_tokens) / max(len(q_tokens | c_tokens), 1)
+    # Взвешиваем: 0.7*seq + 0.3*tokens
+    return 0.7 * s + 0.3 * token_score
 
 
-__all__ = ["classify_query", "verify_candidate_with_llm"]
+def validate_and_process_query(query: str, metadata: Dict[str, Any] = None, index=None, target_audience: str = "все клиенты", top_k: int = 5, rerank_k: int = 3):
+    """
+    Проверяет вопрос на корректность и ищет наиболее подходящие ответы в метаданных.
+
+    Аргументы:
+        query: текст запроса
+        metadata: словарь с полями, сгенерированными в data/embeddings.py (example_questions, template_answers и т.д.)
+        index: опционально — faiss индекс (не обязателен для локального поиска)
+        target_audience: фильтр по аудитории (по желанию)
+        top_k: сколько кандидатов вернуть для ранжирования
+        rerank_k: сколько элементов вернуть в ответе
+
+    Возвращает:
+        dict с ключом 'status' и 'results' — списком рекомендованных ответов
+    """
+    if not query or len(query.strip()) < 3:
+        raise ValueError("Вопрос слишком короткий или отсутствует. Пожалуйста, сформулируйте более подробный запрос.")
+
+    clean_query = re.sub(r'[^\w\s]', '', query).strip()
+    if not clean_query:
+        raise ValueError("Вопрос содержит только специальные символы или недопустимые символы. Пожалуйста, сформулируйте корректный запрос.")
+
+    if len(query) > 1000:
+        raise ValueError("Вопрос слишком длинный. Пожалуйста, сформулируйте запрос короче.")
+
+    metadata = _load_metadata(metadata)
+
+    vector_results = []
+    if index is not None:
+        try:
+            vector_results = search_and_rank(
+                query=query,
+                metadata=metadata,
+                index=index,
+                target_audience=target_audience,
+                top_k=top_k,
+                rerank_k=rerank_k,
+            )
+        except Exception as vector_error:
+            logger.warning("Vector search failed, fallback to fuzzy matching: %s", vector_error, exc_info=True)
+            vector_results = []
+
+    if vector_results:
+        return {
+            'status': 'success',
+            'query': query,
+            'results': vector_results
+        }
+
+    example_questions: List[str] = metadata.get('example_questions', [])
+    combined_texts: List[str] = metadata.get('combined_texts', [])
+    template_answers: List[str] = metadata.get('template_answers', [])
+    main_categories = metadata.get('main_categories', [])
+    sub_categories = metadata.get('sub_categories', [])
+    target_audiences = metadata.get('target_audiences', [])
+    priorities = metadata.get('priorities', [])
+
+    candidates = []
+
+    # Оцениваем по примеру вопроса и по combined_texts
+    for idx, (ex_q, comb) in enumerate(zip(example_questions, combined_texts)):
+        score_q = _score_match(query, ex_q or '')
+        score_c = _score_match(query, comb or '')
+        score = max(score_q, score_c)
+
+        # Бонусы по приоритету / аудитории
+        priority = priorities[idx] if idx < len(priorities) else None
+        audience = target_audiences[idx] if idx < len(target_audiences) else None
+        if priority and isinstance(priority, str) and priority.lower() == 'высокий':
+            score *= 1.1
+        if audience and target_audience and audience == target_audience:
+            score *= 1.05
+
+        candidates.append((score, idx))
+
+    # Сортируем и берём топ_k
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    top = candidates[:top_k]
+
+    results = []
+    for score, idx in top[:rerank_k]:
+        ans = {
+            'idx': int(idx),
+            'similarity_score': float(round(score, 4)),
+            'example_question': example_questions[idx] if idx < len(example_questions) else None,
+            'template_answer': template_answers[idx] if idx < len(template_answers) else None,
+            'main_category': main_categories[idx] if idx < len(main_categories) else None,
+            'sub_category': sub_categories[idx] if idx < len(sub_categories) else None,
+            'priority': priorities[idx] if idx < len(priorities) else None,
+            'target_audience': target_audiences[idx] if idx < len(target_audiences) else None,
+        }
+        results.append(ans)
+
+    return {
+        'status': 'success',
+        'query': query,
+        'results': results
+    }
+
+
